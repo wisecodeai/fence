@@ -191,7 +191,7 @@ class UserSessionInterface(SessionInterface):
                 app.session_cookie_name,
                 token,
                 expires=self.get_expiration_time(app, session),
-                httponly=True,
+                httponly=False,
                 domain=domain,
                 samesite="Lax",
             )
@@ -209,7 +209,7 @@ class UserSessionInterface(SessionInterface):
                 response.set_cookie(
                     config["ACCESS_TOKEN_COOKIE_NAME"],
                     expires=0,
-                    httponly=True,
+                    httponly=False,
                     domain=domain,
                     samesite="Lax",
                 )
@@ -219,7 +219,7 @@ class UserSessionInterface(SessionInterface):
                 response.set_cookie(
                     config["ACCESS_TOKEN_COOKIE_NAME"],
                     expires=0,
-                    httponly=True,
+                    httponly=False,
                     domain=domain,
                     samesite="Lax",
                 )
@@ -245,12 +245,12 @@ class UserSessionInterface(SessionInterface):
             #       expiration it just won't be stored in the cookie
             #       anymore
             response.set_cookie(
-                app.session_cookie_name, expires=0, httponly=True, domain=domain
+                app.session_cookie_name, expires=0, httponly=False, domain=domain
             )
             response.set_cookie(
                 config["ACCESS_TOKEN_COOKIE_NAME"],
                 expires=0,
-                httponly=True,
+                httponly=False,
                 domain=domain,
                 samesite="Lax",
             )
@@ -323,15 +323,14 @@ def _create_access_token_cookie(app, session, response, user):
         forced_exp_time=expiration,
         linked_google_email=linked_google_email,
     ).token
-
     domain = app.session_interface.get_cookie_domain(app)
     response.set_cookie(
         config["ACCESS_TOKEN_COOKIE_NAME"],
         access_token,
         expires=expiration,
-        httponly=True,
+        httponly=False,
         domain=domain,
-        samesite="Lax",
+        samesite="Lax"
     )
 
     return response

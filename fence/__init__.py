@@ -55,7 +55,6 @@ import fence.blueprints.privacy
 import fence.blueprints.register
 import fence.blueprints.ga4gh
 
-
 # for some reason the temp dir does not get created properly if we move
 # this statement to `_setup_prometheus()`
 PROMETHEUS_TMP_COUNTER_DIR = tempfile.TemporaryDirectory()
@@ -66,7 +65,8 @@ PROMETHEUS_TMP_COUNTER_DIR = tempfile.TemporaryDirectory()
 logger = get_logger(__name__, log_level="debug")
 
 app = flask.Flask(__name__)
-CORS(app=app, headers=["content-type", "accept"], expose_headers="*")
+CORS(app=app, headers=["content-type", "accept"], resources={r"/login/wisecode": {"origins": "*"}}, origins=["*"], expose_headers="*", supports_credentials=True)
+app.config["SESSION_COOKIE_HTTPONLY"] = False
 
 
 def warn_about_logger():
@@ -126,7 +126,7 @@ def app_register_blueprints(app):
         fence.blueprints.well_known.blueprint, url_prefix="/.well-known"
     )
 
-    login_blueprint = fence.blueprints.login.make_login_blueprint()
+    login_blueprint = fence.blueprints.login.make_login_blueprint(app)
     app.register_blueprint(login_blueprint, url_prefix="/login")
 
     link_blueprint = fence.blueprints.link.make_link_blueprint()

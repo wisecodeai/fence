@@ -8,9 +8,14 @@ This exists primarily as a legacy support for old configuration, but has been
 repurposed to hold some info used when searching for a provided configuration variable.
 """
 from os.path import expanduser
+import pathlib
 
 # Folders to look in for the *config.yaml for fence
-CONFIG_SEARCH_FOLDERS = ["/var/www/fence", "{}/.gen3/fence".format(expanduser("~"))]
+CONFIG_SEARCH_FOLDERS = [
+    "/var/www/fence",
+    "{}/.gen3/fence".format(expanduser("~")),
+    pathlib.Path().cwd(),
+]
 
 # PLEASE USE NEW config-default.yaml FOR CONFIGURATION VARIABLES, NOT THIS FILE!
 
