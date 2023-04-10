@@ -1,4 +1,4 @@
-# Fence
+# WISEcode for Science Fence Authorization Service
 
 [![Build Status](https://travis-ci.org/uc-cdis/fence.svg?branch=master)](https://travis-ci.org/uc-cdis/fence)
 
@@ -622,4 +622,6 @@ Table contains various artifacts in fence that have temporary lifetimes and thei
 | Client SA (for User) Key             | 10 days      | FALSE       | N/A                   | Obtained by the user themselves for temp access. Can optionally provide an expiration less than 10 days                              |
 | User Primary SA Key                  | 10 days      | FALSE       | N/A                   | Used for Google URL signing                                                              |
 | User Primary SA Key for URL Signing  | 30 days      | FALSE       | N/A                   |                                                                                          |
+
 | Sliding Session Window               | 15 minutes   | TRUE        | 8 hours               | access_token cookies get generated automatically when expired if session is still active |
+

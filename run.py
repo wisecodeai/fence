@@ -4,6 +4,11 @@ from alembic.config import main as alembic_main
 
 from fence import app, app_init, config
 
+import dotenv
+
+dotenv.load_dotenv()
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "-c",

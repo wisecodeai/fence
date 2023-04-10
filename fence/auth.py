@@ -209,6 +209,12 @@ def login_required(scope=None):
             # if there is authorization header for oauth
             if "Authorization" in flask.request.headers:
                 has_oauth(scope=scope)
+                try:
+                    if not flask.session.get("username"):
+                        login_user(flask.g.user.username, flask.g.user.identity_provider.name)
+                except:
+                    pass
+
                 return f(*args, **kwargs)
             # if there is shibboleth session, then create user session and
             # log user in
