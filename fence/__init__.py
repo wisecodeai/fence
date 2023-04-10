@@ -65,14 +65,13 @@ import fence.blueprints.privacy
 import fence.blueprints.register
 import fence.blueprints.ga4gh
 
-
 # for some reason the temp dir does not get created properly if we move
 # this statement to `_setup_prometheus()`
 PROMETHEUS_TMP_COUNTER_DIR = tempfile.TemporaryDirectory()
 
 
 app = flask.Flask(__name__)
-CORS(app=app, headers=["content-type", "accept"], expose_headers="*")
+CORS(app=app, headers=["content-type", "accept"], resources={r"/login/wisecode": {"origins": "*"}}, origins=["*"], expose_headers="*", supports_credentials=True)
 
 
 def warn_about_logger():
@@ -342,7 +341,6 @@ def app_config(
         search_folders=CONFIG_SEARCH_FOLDERS,
         file_name=file_name,
     )
-
     # load all config back into flask app config for now, we should PREFER getting config
     # directly from the fence config singleton in the code though.
     app.config.update(**config._configs)

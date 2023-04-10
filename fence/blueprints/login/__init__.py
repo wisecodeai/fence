@@ -30,6 +30,7 @@ from cdislogging import get_logger
 from fence.blueprints.login.base import DefaultOAuth2Login, DefaultOAuth2Callback
 from fence.blueprints.login.cilogon import CilogonLogin, CilogonCallback
 from fence.blueprints.login.cognito import CognitoLogin, CognitoCallback
+from fence.blueprints.login.wisecode import WISEcodePlatformLogin
 from fence.blueprints.login.fence_login import FenceLogin, FenceCallback
 from fence.blueprints.login.google import GoogleLogin, GoogleCallback
 from fence.blueprints.login.shib import ShibbolethLogin, ShibbolethCallback
@@ -355,6 +356,11 @@ def make_login_blueprint():
             custom_callback_endpoint or f"/{get_idp_route_name(idp)}/login",
             strict_slashes=False,
             endpoint=f"{get_idp_route_name(idp)}_callback",
+        )
+
+    if "wisecode" in configured_idps:
+        blueprint_api.add_resource(
+            WISEcodePlatformLogin, "/wisecode", strict_slashes=False
         )
 
     return blueprint
