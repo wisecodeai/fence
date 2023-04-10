@@ -1,5 +1,6 @@
 import flask
 from flask_sqlalchemy_session import current_session
+from datetime import datetime
 from functools import wraps
 import urllib.request, urllib.parse, urllib.error
 
@@ -57,7 +58,9 @@ def build_redirect_url(hostname, path):
     return redirect_base + path
 
 
-def login_user(username, provider, fence_idp=None, shib_idp=None, email=None):
+def login_user(
+    username, provider, fence_idp=None, shib_idp=None, email=None, id_from_idp=None
+):
     """
     Login a user with the given username and provider. Set values in Flask
     session to indicate the user being logged in. In addition, commit the user
@@ -70,6 +73,8 @@ def login_user(username, provider, fence_idp=None, shib_idp=None, email=None):
         shib_idp (str, optional): Downstreawm shibboleth IdP
         email (str, optional): email of user (may or may not match username depending
             on the IdP)
+        id_from_idp (str, optional): id from the IDP (which may be different than
+            the username)
     """
 
     def set_flask_session_values(user):
@@ -93,6 +98,8 @@ def login_user(username, provider, fence_idp=None, shib_idp=None, email=None):
     user = query_for_user(session=current_session, username=username)
     if user:
         _update_users_email(user, email)
+        _update_users_id_from_idp(user, id_from_idp)
+        _update_users_last_auth(user)
 
         #  This expression is relevant to those users who already have user and
         #  idp info persisted to the database. We return early to avoid
@@ -101,11 +108,17 @@ def login_user(username, provider, fence_idp=None, shib_idp=None, email=None):
             set_flask_session_values(user)
             return
     else:
-        if email:
-            user = User(username=username, email=email)
-        else:
-            user = User(username=username)
+        # we need a new user
+        user = User(username=username)
 
+        if email:
+            user.email = email
+
+        if id_from_idp:
+            user.id_from_idp = id_from_idp
+            # TODO: update iss_sub mapping table?
+
+    # setup idp connection for new user (or existing user w/o it setup)
     idp = (
         current_session.query(IdentityProvider)
         .filter(IdentityProvider.name == provider)
@@ -184,8 +197,8 @@ def login_required(scope=None):
                 ]
             else:
                 # fall back on "providers"
-                enable_shib = "shibboleth" in config.get(
-                    "ENABLED_IDENTITY_PROVIDERS", {}
+                enable_shib = "shibboleth" in (
+                    config.get("ENABLED_IDENTITY_PROVIDERS") or {}
                 ).get("providers", {})
 
             if enable_shib and "SHIBBOLETH_HEADER" in config:
@@ -230,12 +243,14 @@ def has_oauth(scope=None):
     except JWTError as e:
         raise Unauthorized("failed to validate token: {}".format(e))
 
-    user_id = access_token_claims["sub"]
-    user = current_session.query(User).filter_by(id=int(user_id)).first()
-    if not user:
-        raise Unauthorized("no user found with id: {}".format(user_id))
-    # set some application context for current user and client id
-    flask.g.user = user
+    if "sub" in access_token_claims:
+        user_id = access_token_claims["sub"]
+        user = current_session.query(User).filter_by(id=int(user_id)).first()
+        if not user:
+            raise Unauthorized("no user found with id: {}".format(user_id))
+        # set some application context for current user
+        flask.g.user = user
+    # set some application context for current client id
     # client_id should be None if the field doesn't exist or is empty
     flask.g.client_id = access_token_claims.get("azp") or None
     flask.g.token = access_token_claims
@@ -278,3 +293,28 @@ def _update_users_email(user, email):
 
         current_session.add(user)
         current_session.commit()
+
+
+def _update_users_id_from_idp(user, id_from_idp):
+    """
+    Update id_from_idp if provided and doesn't match db entry.
+    """
+    if id_from_idp and user.id_from_idp != id_from_idp:
+        logger.info(
+            f"Updating username {user.username}'s id_from_idp from {user.id_from_idp} to {id_from_idp}"
+        )
+        user.id_from_idp = id_from_idp
+
+        current_session.add(user)
+        current_session.commit()
+
+
+def _update_users_last_auth(user):
+    """
+    Update _last_auth.
+    """
+    logger.info(f"Updating username {user.username}'s _last_auth.")
+    user._last_auth = datetime.now()
+
+    current_session.add(user)
+    current_session.commit()

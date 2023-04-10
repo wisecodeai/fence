@@ -18,8 +18,7 @@ class CognitoOauth2Client(Oauth2ClientBase):
         super(CognitoOauth2Client, self).__init__(
             settings,
             logger,
-            scope="openid email",
-            discovery_url=settings["discovery_url"],
+            scope=settings.get("scope") or "openid email",
             idp="Amazon Cognito",
             HTTP_PROXY=HTTP_PROXY,
         )
@@ -48,17 +47,14 @@ class CognitoOauth2Client(Oauth2ClientBase):
             jwks_endpoint = self.get_value_from_discovery_doc("jwks_uri", "")
             claims = self.get_jwt_claims_identity(token_endpoint, jwks_endpoint, code)
 
-            self.logger.info(
-                "Received id token from Cognito:\n{}".format(
-                    json.dumps(claims, indent=4)
-                )
-            )
+            self.logger.info(f"Received id token from Cognito: {claims}")
 
-            if claims["email"] and (
-                claims["email_verified"] or self.settings["assume_emails_verified"]
+            if claims.get("email") and (
+                claims.get("email_verified")
+                or self.settings.get("assume_emails_verified")
             ):
-                return {"email": claims["email"]}
-            elif claims["email"]:
+                return {"email": claims["email"], "sub": claims.get("sub")}
+            elif claims.get("email"):
                 return {"error": "Email is not verified"}
             else:
                 return {"error": "Can't get email from claims"}

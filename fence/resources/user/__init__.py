@@ -105,7 +105,10 @@ def get_user_info(current_session, username):
         info["shib_idp"] = flask.session["shib_idp"]
 
     # User SAs are stored in db with client_id = None
-    primary_service_account = get_service_account(client_id=None, user_id=user.id) or {}
+    primary_service_account = (
+        get_service_account(client_id=None, user_id=user.id, username=user.username)
+        or {}
+    )
     primary_service_account_email = getattr(primary_service_account, "email", None)
     info["primary_google_service_account"] = primary_service_account_email
 
@@ -157,7 +160,11 @@ def get_user_info(current_session, username):
         encoded_access_token = None
 
     if encoded_access_token:
-        at_scopes = jwt.decode(encoded_access_token, verify=False).get("scope", "")
+        at_scopes = jwt.decode(
+            encoded_access_token,
+            algorithms=["RS256"],
+            options={"verify_signature": False},
+        ).get("scope", "")
         if "ga4gh_passport_v1" in at_scopes:
             info["ga4gh_passport_v1"] = []
 

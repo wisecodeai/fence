@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 import time
 import mock
 
@@ -10,6 +11,7 @@ from userdatamodel.models import Group
 from userdatamodel.driver import SQLAlchemyDriver
 
 from fence.config import config
+from fence.errors import UserError
 from fence.jwt.validate import validate_jwt
 from fence.utils import create_client
 from fence.models import (
@@ -23,16 +25,22 @@ from fence.models import (
     GoogleBucketAccessGroup,
     CloudProvider,
     Bucket,
+    GoogleProxyGroup,
     ServiceAccountToGoogleBucketAccessGroup,
+    GoogleProxyGroupToGoogleBucketAccessGroup,
     GoogleServiceAccountKey,
     StorageAccess,
+    GA4GHVisaV1,
 )
 from fence.scripting.fence_create import (
     delete_users,
     JWTCreator,
     create_client_action,
     delete_client_action,
+    delete_expired_clients_action,
+    rotate_client_action,
     delete_expired_service_accounts,
+    delete_expired_google_access,
     link_external_bucket,
     remove_expired_google_service_account_keys,
     verify_bucket_access_group,
@@ -42,8 +50,10 @@ from fence.scripting.fence_create import (
     modify_client_action,
     create_projects,
     create_group,
+    cleanup_expired_ga4gh_information,
 )
-
+from tests.dbgap_sync.conftest import add_visa_manually
+from tests.utils import add_test_ras_user
 
 ROOT_DIR = "./"
 
@@ -53,6 +63,20 @@ def mock_arborist(mock_arborist_requests):
     mock_arborist_requests()
 
 
+def delete_client_if_exists(db, client_name, username=None):
+    driver = SQLAlchemyDriver(db)
+    with driver.session as session:
+        clients = session.query(Client).filter_by(name=client_name).all()
+        if clients:
+            for client in clients:
+                session.delete(client)
+        if username:
+            user = session.query(User).filter_by(username=username).first()
+            if user is not None:
+                session.delete(user)
+        session.commit()
+
+
 def create_client_action_wrapper(
     to_test,
     db=None,
@@ -60,6 +84,7 @@ def create_client_action_wrapper(
     username="exampleuser",
     urls=["https://betawebapp.example/fence", "https://webapp.example/fence"],
     grant_types=["authorization_code", "refresh_token", "implicit"],
+    expires_in=None,
     **kwargs,
 ):
     """
@@ -73,18 +98,11 @@ def create_client_action_wrapper(
         username=username,
         urls=urls,
         grant_types=grant_types,
+        expires_in=expires_in,
         **kwargs,
     )
     to_test()
-    driver = SQLAlchemyDriver(db)
-    with driver.session as session:
-        client = session.query(Client).filter_by(name=client_name).first()
-        user = session.query(User).filter_by(username=username).first()
-        if client is not None:
-            session.delete(client)
-        if user is not None:
-            session.delete(user)
-        session.commit()
+    delete_client_if_exists(db, client_name, username)
 
 
 def test_create_client_inits_default_allowed_scopes(db_session):
@@ -153,11 +171,123 @@ def test_create_client_doesnt_create_client_with_invalid_scope(db_session):
         client_after = db_session.query(Client).filter_by(name=client_name).all()
         assert len(client_after) == 0
 
+    with pytest.raises(ValueError):
+        create_client_action_wrapper(
+            to_test,
+            client_name=client_name,
+            allowed_scopes=["openid", "user", "data", "invalid_scope"],
+        )
+
+
+def test_create_client_without_user_and_url(db_session):
+    """
+    Test that a client with the authorization_code grant cannot be created
+    without providing a username or redirect URLs.
+    """
+    client_name = "client_with_client_credentials"
+    grant_types = ["authorization_code", "client_credentials"]
+
+    def to_test():
+        client_after = db_session.query(Client).filter_by(name=client_name).all()
+        assert len(client_after) == 0
+
+    with pytest.raises(AssertionError):
+        create_client_action_wrapper(
+            to_test,
+            client_name=client_name,
+            username=None,
+            urls=None,
+            grant_types=grant_types,
+        )
+
+
+def test_create_client_with_client_credentials(db_session):
+    """
+    Test that a client with the client_credentials grant can be created
+    without providing a username or redirect URLs.
+    """
+    client_name = "client_with_client_credentials"
+    grant_types = ["client_credentials"]
+
+    def to_test():
+        saved_client = db_session.query(Client).filter_by(name=client_name).first()
+        assert saved_client.grant_types == grant_types
+
     create_client_action_wrapper(
         to_test,
         client_name=client_name,
-        allowed_scopes=["openid", "user", "data", "invalid_scope"],
+        username=None,
+        urls=None,
+        grant_types=grant_types,
     )
+
+
+@pytest.mark.parametrize("expires_in", [None, 0, 1000, 0.5, -10, "not-valid"])
+@pytest.mark.parametrize("grant_type", ["authorization_code", "client_credentials"])
+def test_create_client_with_expiration(db_session, grant_type, expires_in):
+    """
+    Test that a client can be created with a valid expiration.
+    """
+    client_name = "client_with_expiration"
+    grant_types = [grant_type]
+    now = datetime.now()
+
+    def to_test():
+        saved_client = db_session.query(Client).filter_by(name=client_name).first()
+        assert saved_client.grant_types == grant_types
+        if not expires_in:
+            assert saved_client.expires_at == 0
+        else:
+            expected_expires_at = (now + timedelta(days=expires_in)).timestamp()
+            # allow up to 1 second variation to account for test execution
+            assert saved_client.expires_at <= expected_expires_at + 1
+            assert saved_client.expires_at >= expected_expires_at - 1
+
+    if expires_in in [-10, "not-valid"]:
+        with pytest.raises(UserError):
+            create_client_action_wrapper(
+                to_test,
+                client_name=client_name,
+                grant_types=grant_types,
+                expires_in=expires_in,
+            )
+    else:
+        create_client_action_wrapper(
+            to_test,
+            client_name=client_name,
+            grant_types=grant_types,
+            expires_in=expires_in,
+        )
+
+
+def test_create_client_duplicate_name(db_session):
+    """
+    Test that we can't create a new client with the same name as an existing client.
+    """
+    client_name = "non_unique_client_name"
+    try:
+        # successfully create a client
+        create_client_action(
+            config["DB"],
+            client=client_name,
+            username="exampleuser",
+            urls=["https://localhost"],
+            grant_types=["authorization_code"],
+        )
+        saved_client = db_session.query(Client).filter_by(name=client_name).first()
+        assert saved_client.name == client_name
+
+        # we should fail to create a 2nd client with the same name
+        with pytest.raises(Exception, match=f"client {client_name} already exists"):
+            create_client_action(
+                config["DB"],
+                client=client_name,
+                username="exampleuser",
+                urls=["https://localhost"],
+                grant_types=["authorization_code"],
+            )
+    finally:
+        delete_client_if_exists(config["DB"], client_name)
 
 
 def test_client_delete(app, db_session, cloud_manager, test_user_a):
@@ -166,7 +296,13 @@ def test_client_delete(app, db_session, cloud_manager, test_user_a):
     service accounts and the client themself.
     """
     client_name = "test123"
-    client = Client(client_id=client_name, client_secret="secret", name=client_name)
+    client = Client(
+        client_id=client_name,
+        client_secret="secret",
+        name=client_name,
+        user=User(username="client_user"),
+        redirect_uris="localhost",
+    )
     db_session.add(client)
     db_session.commit()
 
@@ -201,7 +337,13 @@ def test_client_delete_error(app, db_session, cloud_manager, test_user_a):
     we don't remove it from the db.
     """
     client_name = "test123"
-    client = Client(client_id=client_name, client_secret="secret", name=client_name)
+    client = Client(
+        client_id=client_name,
+        client_secret="secret",
+        name=client_name,
+        user=User(username="client_user"),
+        redirect_uris=["localhost"],
+    )
     db_session.add(client)
     db_session.commit()
 
@@ -230,6 +372,192 @@ def test_client_delete_error(app, db_session, cloud_manager, test_user_a):
     # make sure client is deleted but service account we couldn't delete stays
     assert len(client_after) == 0
     assert len(client_service_account_after) == 1
+
+
+@pytest.mark.parametrize("post_to_slack", [False, True])
+def test_client_delete_expired(app, db_session, cloud_manager, post_to_slack):
+    """
+    Test that the expired clients are correctly deleted along with their service accounts.
+    Clients with "None" or "0" expiration do not expire.
+    """
+    # create a set of clients with different expirations
+    user = User(username="client_user")
+    for i, expires_in in enumerate([0.0000001, 0.000005, 1, 1000, None, 0]):
+        client = Client(
+            client_id=f"test_client_id_{i}",
+            client_secret=f"secret_{i}",
+            name=f"test_client_{i}",
+            user=user,
+            redirect_uris=["localhost", "other-uri"],
+            expires_in=expires_in,
+        )
+        db_session.add(client)
+    db_session.commit()
+
+    # create a service account for one of the clients that will be removed
+    client_service_account = GoogleServiceAccount(
+        google_unique_id="jf09238ufposijf",
+        client_id="test_client_id_0",
+        user_id=user.id,
+        google_project_id="test",
+        email="someemail@something.com",
+    )
+    db_session.add(client_service_account)
+    db_session.commit()
+
+    # empty return means success
+    cloud_manager.return_value.__enter__.return_value.delete_service_account.return_value = (
+        {}
+    )
+
+    # wait 1 second for the clients to expire
+    time.sleep(1)
+
+    requests_mocker = mock.patch(
+        "fence.scripting.fence_create.requests", new_callable=mock.Mock
+    )
+    with requests_mocker as mocked_requests:
+        # delete the expired clients
+        if not post_to_slack:
+            delete_expired_clients_action(config["DB"])
+        else:
+            slack_webhook = "test-webhook"
+            delete_expired_clients_action(
+                config["DB"], slack_webhook=slack_webhook, warning_days=2
+            )
+            calls = mocked_requests.post.call_args_list
+            assert (
+                len(calls) == 2
+            ), f"Expected 2 Slack webhook calls, but got {len(calls)}."
+
+            # check the call about clients that have expired
+            args, kwargs = calls[0]
+            assert len(args) == 1 and args[0] == slack_webhook
+            msg = kwargs.get("json", {}).get("attachments", [{}])[0].get("text")
+            assert "test_client_0" in msg
+            assert "test_client_1" in msg
+
+            # check the call about clients that expire soon
+            args, kwargs = calls[1]
+            assert len(args) == 1 and args[0] == slack_webhook
+            msg = kwargs.get("json", {}).get("attachments", [{}])[0].get("text")
+            assert "test_client_2" in msg
+
+    # make sure expired clients are deleted
+    clients_after = db_session.query(Client).all()
+    assert sorted([c.name for c in clients_after]) == [
+        "test_client_2",
+        "test_client_3",
+        "test_client_4",
+        "test_client_5",
+    ]
+
+    # make sure the service account for the expired client are deleted
+    client_sa_after = (
+        db_session.query(GoogleServiceAccount)
+        .filter_by(client_id="test_client_id_0")
+        .all()
+    )
+    assert len(client_sa_after) == 0
+
+
+def test_client_rotate(db_session):
+    """
+    Create a client, rotate it and check that the 2 rows in the DB are identical except
+    for the client ID, secret and expiration.
+    """
+    client_name = "client_abc"
+
+    try:
+        create_client_action(
+            config["DB"],
+            client=client_name,
+            username="exampleuser",
+            urls=["https://localhost"],
+            grant_types=["authorization_code"],
+            expires_in=30,
+        )
+        clients = db_session.query(Client).filter_by(name=client_name).all()
+        assert len(clients) == 1
+        assert clients[0].name == client_name
+
+        rotate_client_action(config["DB"], client_name, 20)
+
+        clients = db_session.query(Client).filter_by(name=client_name).all()
+        assert len(clients) == 2
+
+        assert clients[0].name == client_name
+        assert clients[1].name == client_name
+        for attr in [
+            "user",
+            "redirect_uris",
+            "_allowed_scopes",
+            "description",
+            "auto_approve",
+            "grant_types",
+            "is_confidential",
+            "token_endpoint_auth_method",
+        ]:
+            assert getattr(clients[0], attr) == getattr(
+                clients[1], attr
+            ), f"attribute '{attr}' differs"
+        assert clients[0].client_id != clients[1].client_id
+        assert clients[0].client_secret != clients[1].client_secret
+        assert clients[0].expires_at != clients[1].expires_at
+    finally:
+        delete_client_if_exists(config["DB"], client_name)
+
+
+def test_client_rotate_and_actions(db_session, capsys):
+    """
+    Check that listing, modifying or deleting a client (after rotating it) affects
+    all of this client's rows in the DB.
+    """
+    client_name = "client_abc"
+
+    # create a client and rotate the credentials twice
+    url1 = "https://localhost"
+    create_client_action(
+        config["DB"],
+        client=client_name,
+        username="exampleuser",
+        urls=[url1],
+        grant_types=["authorization_code"],
+        expires_in=30,
+    )
+    rotate_client_action(config["DB"], client_name, 20)
+    rotate_client_action(config["DB"], client_name, 10)
+
+    # this should result in 3 rows for this client in the DB
+    clients = db_session.query(Client).filter_by(name=client_name).all()
+    assert len(clients) == 3
+    for i in range(3):
+        assert clients[i].name == client_name
+
+    # check that `list_client_action` lists all the rows
+    capsys.readouterr()  # clear the buffer
+    list_client_action(db_session)
+    captured_logs = str(capsys.readouterr())
+    assert captured_logs.count("'name': 'client_abc'") == 3
+    for i in range(3):
+        assert captured_logs.count(f"'client_id': '{clients[i].client_id}'") == 1
+
+    # check that `modify_client_action` updates all the rows
+    description = "new description"
+    url2 = "new url"
+    modify_client_action(
+        db_session, client_name, description=description, urls=[url2], append=True
+    )
+    clients = db_session.query(Client).filter_by(name=client_name).all()
+    assert len(clients) == 3
+    for i in range(3):
+        assert clients[i].description == description
+        assert clients[i].redirect_uri == f"{url1}\n{url2}"
+
+    # check that `delete_client_action` deletes all the rows
+    delete_client_action(config["DB"], client_name)
+    clients = db_session.query(Client).filter_by(name=client_name).all()
+    assert len(clients) == 0
 
 
 def test_delete_users(app, db_session, example_usernames):
@@ -384,9 +712,38 @@ def test_create_refresh_token_with_found_user(
     assert db_token is not None
 
 
-def _setup_service_account_to_google_bucket_access_group(db_session):
+def _setup_ga4gh_info(
+    db_session, rsa_private_key, kid, access_1_expires=None, access_2_expires=None
+):
     """
     Setup some testing data.
+
+    Args:
+        access_1_expires (str, optional): expiration for the Proxy Group ->
+            Google Bucket Access Group for user 1, defaults to None
+        access_2_expires (str, optional): expiration for the Proxy Group ->
+            Google Bucket Access Group for user 2, defaults to None
+    """
+    test_user = add_test_ras_user(db_session)
+    _, visa1 = add_visa_manually(
+        db_session, test_user, rsa_private_key, kid, expires=access_1_expires
+    )
+    _, visa2 = add_visa_manually(
+        db_session, test_user, rsa_private_key, kid, expires=access_2_expires
+    )
+
+    return {"ga4gh_visas": {"1": visa1.id, "2": visa2.id, "test_user": test_user}}
+
+
+def _setup_google_access(db_session, access_1_expires=None, access_2_expires=None):
+    """
+    Setup some testing data.
+
+    Args:
+        access_1_expires (str, optional): expiration for the Proxy Group ->
+            Google Bucket Access Group for user 1, defaults to None
+        access_2_expires (str, optional): expiration for the Proxy Group ->
+            Google Bucket Access Group for user 2, defaults to None
     """
     cloud_provider = CloudProvider(
         name="test_provider",
@@ -417,21 +774,39 @@ def _setup_service_account_to_google_bucket_access_group(db_session):
     db_session.add(bucket1)
     db_session.commit()
 
+    gpg1 = GoogleProxyGroup(id=1, email="test1@gmail.com")
+    gpg2 = GoogleProxyGroup(id=2, email="test2@gmail.com")
+    db_session.add(gpg1)
+    db_session.add(gpg2)
+    db_session.commit()
+
+    gbag1 = GoogleBucketAccessGroup(
+        bucket_id=bucket1.id,
+        email="testgroup1@gmail.com",
+        privileges=["read-storage", "write-storage"],
+    )
+    gbag2 = GoogleBucketAccessGroup(
+        bucket_id=bucket1.id,
+        email="testgroup2@gmail.com",
+        privileges=["read-storage"],
+    )
+    db_session.add(gbag1)
+    db_session.add(gbag2)
+    db_session.commit()
+
     db_session.add(
-        GoogleBucketAccessGroup(
-            bucket_id=bucket1.id,
-            email="testgroup1@gmail.com",
-            privileges=["read-storage", "write-storage"],
+        GoogleProxyGroupToGoogleBucketAccessGroup(
+            proxy_group_id=gpg1.id, access_group_id=gbag1.id, expires=access_1_expires
         )
     )
     db_session.add(
-        GoogleBucketAccessGroup(
-            bucket_id=bucket1.id,
-            email="testgroup2@gmail.com",
-            privileges=["read-storage"],
+        GoogleProxyGroupToGoogleBucketAccessGroup(
+            proxy_group_id=gpg2.id, access_group_id=gbag2.id, expires=access_2_expires
         )
     )
     db_session.commit()
+
+    return {"google_proxy_group_ids": {"1": gpg1.id, "2": gpg2.id}}
 
 
 def test_delete_expired_service_accounts_with_one_fail_first(
@@ -449,7 +824,7 @@ def test_delete_expired_service_accounts_with_one_fail_first(
         HttpError(mock.Mock(status=403), bytes("Permission denied", "utf-8")),
         {},
     ]
-    _setup_service_account_to_google_bucket_access_group(db_session)
+    _setup_google_access(db_session)
     service_accounts = db_session.query(UserServiceAccount).all()
     google_bucket_access_grps = db_session.query(GoogleBucketAccessGroup).all()
 
@@ -499,7 +874,7 @@ def test_delete_expired_service_accounts_with_one_fail_second(
         {},
         HttpError(mock.Mock(status=403), bytes("Permission denied", "utf-8")),
     ]
-    _setup_service_account_to_google_bucket_access_group(db_session)
+    _setup_google_access(db_session)
     service_accounts = db_session.query(UserServiceAccount).all()
     google_bucket_access_grps = db_session.query(GoogleBucketAccessGroup).all()
 
@@ -546,7 +921,7 @@ def test_delete_expired_service_accounts(cloud_manager, app, db_session):
     cloud_manager.return_value.__enter__.return_value.remove_member_from_group.return_value = (
         {}
     )
-    _setup_service_account_to_google_bucket_access_group(db_session)
+    _setup_google_access(db_session)
     service_accounts = db_session.query(UserServiceAccount).all()
     google_bucket_access_grps = db_session.query(GoogleBucketAccessGroup).all()
 
@@ -593,7 +968,7 @@ def test_delete_not_expired_service_account(app, db_session):
     import fence
 
     fence.settings = MagicMock()
-    _setup_service_account_to_google_bucket_access_group(db_session)
+    _setup_google_access(db_session)
     service_account = db_session.query(UserServiceAccount).first()
     google_bucket_access_grp1 = db_session.query(GoogleBucketAccessGroup).first()
 
@@ -616,6 +991,218 @@ def test_delete_not_expired_service_account(app, db_session):
     # check db again to make sure the record still exists
     records = db_session.query(ServiceAccountToGoogleBucketAccessGroup).all()
     assert len(records) == 1
+
+
+def test_delete_not_expired_google_access(app, db_session):
+    """
+    Test the case that there is no expired google access
+    """
+    import fence
+
+    fence.settings = MagicMock()
+
+    current_time = int(time.time())
+    # 1 not expired, 2 not expired
+    access_1_expires = current_time + 3600
+    access_2_expires = current_time + 3600
+    _setup_google_access(
+        db_session, access_1_expires=access_1_expires, access_2_expires=access_2_expires
+    )
+
+    google_access = db_session.query(GoogleProxyGroupToGoogleBucketAccessGroup).all()
+    google_proxy_groups = db_session.query(GoogleProxyGroup).all()
+    google_bucket_access_grps = db_session.query(GoogleBucketAccessGroup).all()
+
+    # check database to make sure all the service accounts exist
+    pre_deletion_google_access_size = len(google_access)
+    pre_deletion_google_proxy_groups_size = len(google_proxy_groups)
+    pre_deletion_google_bucket_access_grps_size = len(google_bucket_access_grps)
+
+    # call function to delete expired service account
+    delete_expired_google_access(config["DB"])
+
+    google_access = db_session.query(GoogleProxyGroupToGoogleBucketAccessGroup).all()
+    google_proxy_groups = db_session.query(GoogleProxyGroup).all()
+    google_bucket_access_grps = db_session.query(GoogleBucketAccessGroup).all()
+
+    # check database again. Expect nothing is deleted
+    assert len(google_access) == pre_deletion_google_access_size
+    assert len(google_proxy_groups) == pre_deletion_google_proxy_groups_size
+    assert len(google_bucket_access_grps) == pre_deletion_google_bucket_access_grps_size
+
+
+def test_delete_not_specified_expiration_google_access(app, db_session):
+    """
+    Test the case that there is no expiration time specified in the db for google access
+    In this case, we expect backwards compatible behavior, e.g. they are NOT removed
+    """
+    import fence
+
+    fence.settings = MagicMock()
+
+    current_time = int(time.time())
+    access_1_expires = None
+    access_2_expires = None
+    _setup_google_access(
+        db_session, access_1_expires=access_1_expires, access_2_expires=access_2_expires
+    )
+
+    google_access = db_session.query(GoogleProxyGroupToGoogleBucketAccessGroup).all()
+    google_proxy_groups = db_session.query(GoogleProxyGroup).all()
+    google_bucket_access_grps = db_session.query(GoogleBucketAccessGroup).all()
+
+    # check database to make sure all the service accounts exist
+    pre_deletion_google_access_size = len(google_access)
+    pre_deletion_google_proxy_groups_size = len(google_proxy_groups)
+    pre_deletion_google_bucket_access_grps_size = len(google_bucket_access_grps)
+
+    # call function to delete expired service account
+    delete_expired_google_access(config["DB"])
+
+    google_access = db_session.query(GoogleProxyGroupToGoogleBucketAccessGroup).all()
+    google_proxy_groups = db_session.query(GoogleProxyGroup).all()
+    google_bucket_access_grps = db_session.query(GoogleBucketAccessGroup).all()
+
+    # check database again. Expect nothing is deleted
+    assert len(google_access) == pre_deletion_google_access_size
+    assert len(google_proxy_groups) == pre_deletion_google_proxy_groups_size
+    assert len(google_bucket_access_grps) == pre_deletion_google_bucket_access_grps_size
+
+
+def test_delete_expired_google_access(cloud_manager, app, db_session):
+    """
+    Test deleting all expired service accounts
+    """
+    import fence
+
+    fence.settings = MagicMock()
+    cloud_manager.return_value.__enter__.return_value.remove_member_from_group.return_value = (
+        {}
+    )
+
+    current_time = int(time.time())
+    # 1 expired, 2 not expired
+    access_1_expires = current_time - 3600
+    access_2_expires = current_time + 3600
+    setup_results = _setup_google_access(
+        db_session, access_1_expires=access_1_expires, access_2_expires=access_2_expires
+    )
+
+    google_access = db_session.query(GoogleProxyGroupToGoogleBucketAccessGroup).all()
+    google_proxy_groups = db_session.query(GoogleProxyGroup).all()
+    google_bucket_access_grps = db_session.query(GoogleBucketAccessGroup).all()
+
+    # check database to make sure all the service accounts exist
+    pre_deletion_google_access_size = len(google_access)
+    pre_deletion_google_proxy_groups_size = len(google_proxy_groups)
+    pre_deletion_google_bucket_access_grps_size = len(google_bucket_access_grps)
+
+    # call function to delete expired service account
+    delete_expired_google_access(config["DB"])
+
+    google_access = db_session.query(GoogleProxyGroupToGoogleBucketAccessGroup).all()
+    google_proxy_groups = db_session.query(GoogleProxyGroup).all()
+    google_bucket_access_grps = db_session.query(GoogleBucketAccessGroup).all()
+
+    # check database again. Expect 1 access is deleted - proxy group and gbag should be intact
+    assert len(google_access) == pre_deletion_google_access_size - 1
+    remaining_ids = [str(gpg_to_gbag.proxy_group_id) for gpg_to_gbag in google_access]
+
+    # b/c expired
+    assert str(setup_results["google_proxy_group_ids"]["1"]) not in remaining_ids
+
+    # b/c not expired
+    assert str(setup_results["google_proxy_group_ids"]["2"]) in remaining_ids
+
+    assert len(google_proxy_groups) == pre_deletion_google_proxy_groups_size
+    assert len(google_bucket_access_grps) == pre_deletion_google_bucket_access_grps_size
+
+
+def test_delete_expired_google_access_with_one_fail_first(
+    cloud_manager, app, db_session
+):
+    """
+    Test the case that there is a failure of removing from google group in GCP.
+    In this case, we still want the expired record to exist in the db so we can try to
+    remove it again.
+    """
+    from googleapiclient.errors import HttpError
+    import fence
+
+    fence.settings = MagicMock()
+    cirrus.config.update = MagicMock()
+    cloud_manager.return_value.__enter__.return_value.remove_member_from_group.side_effect = [
+        HttpError(mock.Mock(status=403), bytes("Permission denied", "utf-8")),
+        {},
+    ]
+
+    current_time = int(time.time())
+    # 1 expired, 2 not expired
+    access_1_expires = current_time - 3600
+    access_2_expires = current_time + 3600
+    _setup_google_access(
+        db_session, access_1_expires=access_1_expires, access_2_expires=access_2_expires
+    )
+
+    google_access = db_session.query(GoogleProxyGroupToGoogleBucketAccessGroup).all()
+    google_proxy_groups = db_session.query(GoogleProxyGroup).all()
+    google_bucket_access_grps = db_session.query(GoogleBucketAccessGroup).all()
+
+    # check database to make sure all the service accounts exist
+    pre_deletion_google_access_size = len(google_access)
+    pre_deletion_google_proxy_groups_size = len(google_proxy_groups)
+    pre_deletion_google_bucket_access_grps_size = len(google_bucket_access_grps)
+
+    # call function to delete expired service account
+    delete_expired_google_access(config["DB"])
+
+    google_access = db_session.query(GoogleProxyGroupToGoogleBucketAccessGroup).all()
+    google_proxy_groups = db_session.query(GoogleProxyGroup).all()
+    google_bucket_access_grps = db_session.query(GoogleBucketAccessGroup).all()
+
+    # check database again. Expect nothing is deleted
+    assert len(google_access) == pre_deletion_google_access_size
+    assert len(google_proxy_groups) == pre_deletion_google_proxy_groups_size
+    assert len(google_bucket_access_grps) == pre_deletion_google_bucket_access_grps_size
+
+
+def test_cleanup_expired_ga4gh_information(app, db_session, rsa_private_key, kid):
+    """
+    Test removal of expired ga4gh info
+    """
+    import fence
+
+    current_time = int(time.time())
+    # 1 expired, 2 not expired
+    access_1_expires = current_time - 3600
+    access_2_expires = current_time + 3600
+    setup_results = _setup_ga4gh_info(
+        db_session,
+        rsa_private_key,
+        kid,
+        access_1_expires=access_1_expires,
+        access_2_expires=access_2_expires,
+    )
+
+    ga4gh_visas = db_session.query(GA4GHVisaV1).all()
+
+    # check database to make sure all the service accounts exist
+    pre_deletion_ga4gh_visas_size = len(ga4gh_visas)
+
+    # call function to delete expired service account
+    cleanup_expired_ga4gh_information(config["DB"])
+
+    ga4gh_visas = db_session.query(GA4GHVisaV1).all()
+
+    # check database again. Expect 1 access is deleted - proxy group and gbag should be intact
+    assert len(ga4gh_visas) == pre_deletion_ga4gh_visas_size - 1
+    remaining_ids = [str(item.id) for item in ga4gh_visas]
+
+    # b/c expired
+    assert str(setup_results["ga4gh_visas"]["1"]) not in remaining_ids
+
+    # b/c not expired
+    assert str(setup_results["ga4gh_visas"]["2"]) in remaining_ids
 
 
 def test_verify_bucket_access_group_no_interested_accounts(
@@ -996,7 +1583,13 @@ def test_delete_expired_service_account_keys_both_user_and_client(
 
 def test_list_client_action(db_session, capsys):
     client_name = "test123"
-    client = Client(client_id=client_name, client_secret="secret", name=client_name)
+    client = Client(
+        client_id=client_name,
+        client_secret="secret",
+        name=client_name,
+        user=User(username="client_user"),
+        redirect_uris=["localhost"],
+    )
     db_session.add(client)
     db_session.commit()
     list_client_action(db_session)
@@ -1009,7 +1602,13 @@ def test_list_client_action(db_session, capsys):
 def test_modify_client_action(db_session):
     client_id = "testid"
     client_name = "test123"
-    client = Client(client_id=client_id, client_secret="secret", name=client_name)
+    client = Client(
+        client_id=client_id,
+        client_secret="secret",
+        name=client_name,
+        user=User(username="client_user"),
+        redirect_uris=["localhost"],
+    )
     db_session.add(client)
     db_session.commit()
     modify_client_action(
@@ -1119,9 +1718,11 @@ def test_modify_client_action_modify_allowed_scopes(db_session):
     client_name = "test123"
     client = Client(
         client_id=client_id,
-        client_secret="secret",
+        client_secret="secret",  # pragma: allowlist secret
         name=client_name,
         _allowed_scopes="openid user data",
+        user=User(username="client_user"),
+        redirect_uris=["localhost"],
     )
     db_session.add(client)
     db_session.commit()
@@ -1147,9 +1748,11 @@ def test_modify_client_action_modify_allowed_scopes_append_true(db_session):
     client_name = "test123"
     client = Client(
         client_id=client_id,
-        client_secret="secret",
+        client_secret="secret",  # pragma: allowlist secret
         name=client_name,
         _allowed_scopes="openid user data",
+        user=User(username="client_user"),
+        redirect_uris=["localhost"],
     )
     db_session.add(client)
     db_session.commit()
@@ -1176,9 +1779,10 @@ def test_modify_client_action_modify_append_url(db_session):
     client_name = "test123"
     client = Client(
         client_id=client_id,
-        client_secret="secret",
+        client_secret="secret",  # pragma: allowlist secret
         name=client_name,
         _allowed_scopes="openid user data",
+        user=User(username="client_user"),
         redirect_uris="abcd",
     )
     db_session.add(client)
@@ -1197,3 +1801,43 @@ def test_modify_client_action_modify_append_url(db_session):
     assert client.name == "test321"
     assert client.description == "test client"
     assert client.redirect_uris == ["abcd", "test1", "test2", "test3"]
+
+
+@pytest.mark.parametrize("expires_in", [None, 0, 1000, 0.5, -10, "not-valid"])
+@pytest.mark.parametrize("existing_expiration", [True, False])
+def test_modify_client_expiration(db_session, expires_in, existing_expiration):
+    """
+    Test that a client can be modified with a valid expiration.
+    """
+    # create a client
+    client_name = "test_client"
+    client = Client(
+        client_id="test_client_id",
+        client_secret="secret",
+        name=client_name,
+        user=User(username="client_user"),
+        redirect_uris="localhost",
+        expires_in=(2 if existing_expiration else None),
+    )
+    db_session.add(client)
+    db_session.commit()
+    original_expires_at = client.expires_at
+
+    # modify the client's expiration
+    now = datetime.now()
+    if expires_in in [-10, "not-valid"]:
+        with pytest.raises(UserError):
+            modify_client_action(
+                DB=db_session, client=client_name, expires_in=expires_in
+            )
+    else:
+        modify_client_action(DB=db_session, client=client_name, expires_in=expires_in)
+
+        # make sure the expiration was updated if necessary
+        if not expires_in:
+            assert client.expires_at == original_expires_at
+        else:
+            expected_expires_at = (now + timedelta(days=expires_in)).timestamp()
+            # allow up to 1 second variation to account for test execution
+            assert client.expires_at <= expected_expires_at + 1
+            assert client.expires_at >= expected_expires_at - 1

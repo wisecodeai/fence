@@ -8,14 +8,13 @@ class OrcidOauth2Client(Oauth2ClientBase):
 
     """
 
-    ORCID_DISCOVERY_URL = "https://orcid.org/.well-known/openid-configuration"
+    DISCOVERY_URL = "https://orcid.org/.well-known/openid-configuration"
 
     def __init__(self, settings, logger, HTTP_PROXY=None):
         super(OrcidOauth2Client, self).__init__(
             settings,
             logger,
-            scope="openid",
-            discovery_url=self.ORCID_DISCOVERY_URL,
+            scope=settings.get("scope") or "openid",
             idp="Orcid",
             HTTP_PROXY=HTTP_PROXY,
         )
@@ -44,8 +43,8 @@ class OrcidOauth2Client(Oauth2ClientBase):
             )
             claims = self.get_jwt_claims_identity(token_endpoint, jwks_endpoint, code)
 
-            if claims["sub"]:
-                return {"orcid": claims["sub"]}
+            if claims.get("sub"):
+                return {"orcid": claims["sub"], "sub": claims["sub"]}
             else:
                 return {"error": "Can't get user's orcid"}
         except Exception as e:

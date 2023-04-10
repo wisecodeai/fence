@@ -8,8 +8,7 @@ class OktaOauth2Client(Oauth2ClientBase):
         super(OktaOauth2Client, self).__init__(
             settings,
             logger,
-            scope="openid email",
-            discovery_url=settings["discovery_url"],
+            scope=settings.get("scope") or "openid email",
             idp="Okta",
             HTTP_PROXY=HTTP_PROXY,
         )
@@ -40,8 +39,8 @@ class OktaOauth2Client(Oauth2ClientBase):
             )
             claims = self.get_jwt_claims_identity(token_endpoint, jwks_endpoint, code)
 
-            if claims["email"]:
-                return {"email": claims["email"]}
+            if claims.get("email"):
+                return {"email": claims["email"], "sub": claims.get("sub")}
             else:
                 return {"error": "Can't get user's email!"}
         except Exception as e:

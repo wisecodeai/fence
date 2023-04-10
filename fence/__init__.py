@@ -14,33 +14,43 @@ from userdatamodel.driver import SQLAlchemyDriver
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
 from azure.storage.blob import BlobServiceClient
 from azure.core.exceptions import ResourceNotFoundError
+from urllib.parse import urlparse
+
+# Can't read config yet. Just set to debug for now, else no handlers.
+# Later, in app_config(), will actually set level based on config
+logger = get_logger(__name__, log_level="debug")
+
+# Load the configuration *before* importing modules that rely on it
+from fence.config import config
+from fence.settings import CONFIG_SEARCH_FOLDERS
+
+config.load(
+    config_path=os.environ.get("FENCE_CONFIG_PATH"),
+    search_folders=CONFIG_SEARCH_FOLDERS,
+)
 
 from fence.auth import logout, build_redirect_url
 from fence.blueprints.data.indexd import S3IndexedFileLocation
 from fence.blueprints.login.utils import allowed_login_redirects, domain
 from fence.errors import UserError
 from fence.jwt import keys
-from fence.models import migrate
 from fence.oidc.client import query_client
 from fence.oidc.server import server
 from fence.resources.audit.client import AuditServiceClient
 from fence.resources.aws.boto_manager import BotoManager
-from fence.resources.openid.cilogon_oauth2 import CilogonOauth2Client as CilogonClient
-from fence.resources.openid.cognito_oauth2 import CognitoOauth2Client as CognitoClient
-from fence.resources.openid.google_oauth2 import GoogleOauth2Client as GoogleClient
-from fence.resources.openid.microsoft_oauth2 import (
-    MicrosoftOauth2Client as MicrosoftClient,
-)
-from fence.resources.openid.okta_oauth2 import OktaOauth2Client as OktaClient
-from fence.resources.openid.orcid_oauth2 import OrcidOauth2Client as ORCIDClient
-from fence.resources.openid.synapse_oauth2 import SynapseOauth2Client as SynapseClient
-from fence.resources.openid.ras_oauth2 import RASOauth2Client as RASClient
+from fence.resources.openid.idp_oauth2 import Oauth2ClientBase
+from fence.resources.openid.cilogon_oauth2 import CilogonOauth2Client
+from fence.resources.openid.cognito_oauth2 import CognitoOauth2Client
+from fence.resources.openid.google_oauth2 import GoogleOauth2Client
+from fence.resources.openid.microsoft_oauth2 import MicrosoftOauth2Client
+from fence.resources.openid.okta_oauth2 import OktaOauth2Client
+from fence.resources.openid.orcid_oauth2 import OrcidOauth2Client
+from fence.resources.openid.synapse_oauth2 import SynapseOauth2Client
+from fence.resources.openid.ras_oauth2 import RASOauth2Client
 from fence.resources.storage import StorageManager
 from fence.resources.user.user_session import UserSessionInterface
 from fence.error_handler import get_error_response
 from fence.utils import random_str
-from fence.config import config
-from fence.settings import CONFIG_SEARCH_FOLDERS
 import fence.blueprints.admin
 import fence.blueprints.data
 import fence.blueprints.login
@@ -59,10 +69,6 @@ import fence.blueprints.ga4gh
 # this statement to `_setup_prometheus()`
 PROMETHEUS_TMP_COUNTER_DIR = tempfile.TemporaryDirectory()
 
-
-# Can't read config yet. Just set to debug for now, else no handlers.
-# Later, in app_config(), will actually set level based on config
-logger = get_logger(__name__, log_level="debug")
 
 app = flask.Flask(__name__)
 CORS(app=app, headers=["content-type", "accept"], resources={r"/login/wisecode": {"origins": "*"}}, origins=["*"], expose_headers="*", supports_credentials=True)
@@ -98,16 +104,12 @@ def app_init(
 
 def app_sessions(app):
     app.url_map.strict_slashes = False
-    app.db = SQLAlchemyDriver(config["DB"])
 
-    # TODO: we will make a more robust migration system external from the application
-    #       initialization soon
-    if config["ENABLE_DB_MIGRATION"]:
-        logger.info("Running database migration...")
-        migrate(app.db)
-        logger.info("Done running database migration.")
-    else:
-        logger.info("NOT running database migration.")
+    # override userdatamodel's `setup_db` function which creates tables
+    # and runs database migrations, because Alembic handles that now.
+    # TODO move userdatamodel code to Fence and remove dependencies to it
+    SQLAlchemyDriver.setup_db = lambda _: None
+    app.db = SQLAlchemyDriver(config["DB"])
 
     session = flask_scoped_session(app.db.Session, app)  # noqa
     app.session_interface = UserSessionInterface()
@@ -125,7 +127,7 @@ def app_register_blueprints(app):
         fence.blueprints.well_known.blueprint, url_prefix="/.well-known"
     )
 
-    login_blueprint = fence.blueprints.login.make_login_blueprint(app)
+    login_blueprint = fence.blueprints.login.make_login_blueprint()
     app.register_blueprint(login_blueprint, url_prefix="/login")
 
     link_blueprint = fence.blueprints.link.make_link_blueprint()
@@ -236,7 +238,7 @@ def _check_azure_storage(app):
             logger.debug(err)
 
 
-def _check_aws_creds_and_region(app):
+def _check_buckets_aws_creds_and_region(app):
     """
     Function to ensure that all s3_buckets have a valid credential.
     Additionally, if there is no region it will produce a warning
@@ -245,6 +247,7 @@ def _check_aws_creds_and_region(app):
     buckets = config.get("S3_BUCKETS") or {}
     aws_creds = config.get("AWS_CREDENTIALS") or {}
 
+    # check that AWS creds and regions are configured
     for bucket_name, bucket_details in buckets.items():
         cred = bucket_details.get("cred")
         region = bucket_details.get("region")
@@ -298,6 +301,16 @@ def _check_aws_creds_and_region(app):
                 cred
             )
         )
+
+    # check that all the configured buckets are in `S3_BUCKETS`
+    bucket_names = config["ALLOWED_DATA_UPLOAD_BUCKETS"] or []
+    if config["DATA_UPLOAD_BUCKET"]:
+        bucket_names.append(config["DATA_UPLOAD_BUCKET"])
+    for bucket_name in bucket_names:
+        if bucket_name not in buckets:
+            logger.warning(
+                f"Data upload bucket '{bucket_name}' is not configured in 'S3_BUCKETS'"
+            )
 
 
 def app_config(
@@ -354,7 +367,7 @@ def app_config(
     _setup_oidc_clients(app)
 
     with app.app_context():
-        _check_aws_creds_and_region(app)
+        _check_buckets_aws_creds_and_region(app)
         _check_azure_storage(app)
 
 
@@ -397,71 +410,72 @@ def _set_authlib_cfgs(app):
 
 
 def _setup_oidc_clients(app):
-    oidc = config.get("OPENID_CONNECT", {})
+    configured_idps = config.get("OPENID_CONNECT", {})
 
-    # Add OIDC client for Google if configured.
-    if "google" in oidc:
-        app.google_client = GoogleClient(
-            config["OPENID_CONNECT"]["google"],
-            HTTP_PROXY=config.get("HTTP_PROXY"),
-            logger=logger,
+    clean_idps = [idp.lower().replace(" ", "") for idp in configured_idps]
+    if len(clean_idps) != len(set(clean_idps)):
+        raise ValueError(
+            f"Some IDPs configured in OPENID_CONNECT are not unique once they are lowercased and spaces are removed: {clean_idps}"
         )
 
-    # Add OIDC client for ORCID if configured.
-    if "orcid" in oidc:
-        app.orcid_client = ORCIDClient(
-            config["OPENID_CONNECT"]["orcid"],
-            HTTP_PROXY=config.get("HTTP_PROXY"),
-            logger=logger,
-        )
-
-    # Add OIDC client for RAS if configured.
-    if "ras" in oidc:
-        app.ras_client = RASClient(
-            oidc["ras"],
-            HTTP_PROXY=config.get("HTTP_PROXY"),
-            logger=logger,
-        )
-
-    # Add OIDC client for Synapse if configured.
-    if "synapse" in oidc:
-        app.synapse_client = SynapseClient(
-            oidc["synapse"], HTTP_PROXY=config.get("HTTP_PROXY"), logger=logger
-        )
-
-    # Add OIDC client for Microsoft if configured.
-    if "microsoft" in oidc:
-        app.microsoft_client = MicrosoftClient(
-            config["OPENID_CONNECT"]["microsoft"],
-            HTTP_PROXY=config.get("HTTP_PROXY"),
-            logger=logger,
-        )
-
-    # Add OIDC client for Okta if configured
-    if "okta" in oidc:
-        app.okta_client = OktaClient(
-            config["OPENID_CONNECT"]["okta"],
-            HTTP_PROXY=config.get("HTTP_PROXY"),
-            logger=logger,
-        )
-
-    # Add OIDC client for Amazon Cognito if configured.
-    if "cognito" in oidc:
-        app.cognito_client = CognitoClient(
-            oidc["cognito"], HTTP_PROXY=config.get("HTTP_PROXY"), logger=logger
-        )
-
-    # Add OIDC client for CILogon if configured.
-    if "cilogon" in oidc:
-        app.cilogon_client = CilogonClient(
-            config["OPENID_CONNECT"]["cilogon"],
-            HTTP_PROXY=config.get("HTTP_PROXY"),
-            logger=logger,
-        )
-
-    # Add OIDC client for multi-tenant fence if configured.
-    if "fence" in oidc:
-        app.fence_client = OAuthClient(**config["OPENID_CONNECT"]["fence"])
+    for idp in set(configured_idps.keys()):
+        logger.info(f"Setting up OIDC client for {idp}")
+        settings = configured_idps[idp]
+        if idp == "google":
+            app.google_client = GoogleOauth2Client(
+                settings,
+                HTTP_PROXY=config.get("HTTP_PROXY"),
+                logger=logger,
+            )
+        elif idp == "orcid":
+            app.orcid_client = OrcidOauth2Client(
+                settings,
+                HTTP_PROXY=config.get("HTTP_PROXY"),
+                logger=logger,
+            )
+        elif idp == "ras":
+            app.ras_client = RASOauth2Client(
+                settings,
+                HTTP_PROXY=config.get("HTTP_PROXY"),
+                logger=logger,
+            )
+        elif idp == "synapse":
+            app.synapse_client = SynapseOauth2Client(
+                settings, HTTP_PROXY=config.get("HTTP_PROXY"), logger=logger
+            )
+        elif idp == "microsoft":
+            app.microsoft_client = MicrosoftOauth2Client(
+                settings,
+                HTTP_PROXY=config.get("HTTP_PROXY"),
+                logger=logger,
+            )
+        elif idp == "okta":
+            app.okta_client = OktaOauth2Client(
+                settings,
+                HTTP_PROXY=config.get("HTTP_PROXY"),
+                logger=logger,
+            )
+        elif idp == "cognito":
+            app.cognito_client = CognitoOauth2Client(
+                settings, HTTP_PROXY=config.get("HTTP_PROXY"), logger=logger
+            )
+        elif idp == "cilogon":
+            app.cilogon_client = CilogonOauth2Client(
+                settings,
+                HTTP_PROXY=config.get("HTTP_PROXY"),
+                logger=logger,
+            )
+        elif idp == "fence":
+            app.fence_client = OAuthClient(**settings)
+        else:  # generic OIDC implementation
+            client = Oauth2ClientBase(
+                settings=settings,
+                logger=logger,
+                HTTP_PROXY=config.get("HTTP_PROXY"),
+                idp=settings.get("name") or idp.title(),
+            )
+            clean_idp = idp.lower().replace(" ", "")
+            setattr(app, f"{clean_idp}_client", client)
 
 
 def _setup_arborist_client(app):
