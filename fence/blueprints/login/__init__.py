@@ -14,6 +14,7 @@ from cdislogging import get_logger
 
 from fence.blueprints.login.cilogon import CilogonLogin, CilogonCallback
 from fence.blueprints.login.cognito import CognitoLogin, CognitoCallback
+from fence.blueprints.login.wisecode import WISEcodePlatformLogin
 from fence.blueprints.login.fence_login import FenceLogin, FenceCallback
 from fence.blueprints.login.google import GoogleLogin, GoogleCallback
 from fence.blueprints.login.shib import ShibbolethLogin, ShibbolethCallback
@@ -300,6 +301,11 @@ def make_login_blueprint(app):
         blueprint_api.add_resource(CilogonLogin, "/cilogon", strict_slashes=False)
         blueprint_api.add_resource(
             CilogonCallback, "/cilogon/login", strict_slashes=False
+        )
+
+    if "wisecode" in configured_idps:
+        blueprint_api.add_resource(
+            WISEcodePlatformLogin, "/wisecode", strict_slashes=False
         )
 
     return blueprint
