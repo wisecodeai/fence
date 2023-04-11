@@ -340,6 +340,8 @@ def make_login_blueprint():
         elif idp == "cilogon":
             login_class = CilogonLogin
             callback_class = CilogonCallback
+        elif idp == "wisecode":
+            continue
         else:  # generic OIDC implementation
             login_class = createLoginClass(idp.lower())
             callback_class = createCallbackClass(idp.lower(), configured_idps[idp])
@@ -358,15 +360,15 @@ def make_login_blueprint():
             endpoint=f"{get_idp_route_name(idp)}_callback",
         )
 
+    logger.info(f"Setting up login blueprint for WISEcode")
     if "wisecode" in configured_idps:
         blueprint_api.add_resource(
-            WISEcodePlatformLogin, "/wisecode", strict_slashes=False
+            WISEcodePlatformLogin, 
+            "/wisecode", 
+            strict_slashes=False
         )
 
-    if "wisecode" in configured_idps:
-        blueprint_api.add_resource(
-            WISEcodePlatformLogin, "/wisecode", strict_slashes=False
-        )
+        # WISEcodePlatformCallback
 
     return blueprint
 

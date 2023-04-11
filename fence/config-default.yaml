@@ -204,7 +204,7 @@ DEFAULT_LOGIN_IDP: wisecode
 # - Google? Use: '{{BASE_URL}}/login/google'
 # - Multi-tenant fence (e.g. another fence instance)? Use: '{{BASE_URL}}/login/fence'
 # - Sibboleth? Use: '{{BASE_URL}}/login/shib'
-DEFAULT_LOGIN_URL: '{{BASE_URL}}/login/google'
+DEFAULT_LOGIN_URL: '{{BASE_URL}}/login/cognito'
 
 # `LOGIN_REDIRECT_WHITELIST` is a list of extra whitelisted URLs which can be redirected
 # to by the `/login/*` endpoints. Fence automatically populates this with the redirect

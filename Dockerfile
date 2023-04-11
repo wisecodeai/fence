@@ -4,7 +4,6 @@
 FROM quay.io/cdis/python:python3.9-buster-2.0.0
 
 ENV appname=fence
-ENV PYTHONPATH=/$appname
 
 RUN pip install --upgrade pip
 RUN pip install --upgrade poetry
@@ -24,7 +23,6 @@ RUN mkdir -p /var/www/$appname \
     && chown nginx /var/www/$appname
 
 EXPOSE 80
-
 
 # aws cli v2 - needed for storing files in s3 during usersync k8s job
 RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
@@ -53,21 +51,6 @@ RUN poetry config virtualenvs.create false \
     && poetry install -vv --no-dev --no-interaction \
     && poetry show -v
 
-WORKDIR /$appname
-
-# cache so that poetry install will run if these files change
-COPY poetry.lock pyproject.toml /$appname/
-
-# install Fence and dependencies via poetry
-RUN source $HOME/.poetry/env \
-    && poetry config virtualenvs.create false \
-    && poetry install -vv --no-dev --no-interaction \
-    && poetry show -v
-
-COPY . /$appname
-COPY ./deployment/uwsgi/uwsgi.ini /etc/uwsgi/uwsgi.ini
-COPY ./deployment/uwsgi/wsgi.py /$appname/wsgi.py
-COPY clear_prometheus_multiproc /$appname/clear_prometheus_multiproc
 
 WORKDIR /var/www/$appname
 

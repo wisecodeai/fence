@@ -46,9 +46,9 @@ class WISEcodePlatformLogin(Resource):
                     fence_jwt = generate_signed_access_token(
                         keypair.kid,
                         keypair.private_key,
-                        get_current_user(),
                         config.get("ACCESS_TOKEN_EXPIRES_IN"),
                         scopes,
+                        get_current_user(),
                         forced_exp_time=expiration,
                     ).token
                     response = flask.jsonify(

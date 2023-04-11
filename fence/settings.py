@@ -12,10 +12,8 @@ import pathlib
 
 # Folders to look in for the *config.yaml for fence
 CONFIG_SEARCH_FOLDERS = [
-    pathlib.Path(),
     "/var/www/fence",
-    "{}/.gen3/fence".format(expanduser("~")),
-    "/fence"
+    "{}/.gen3/fence".format(expanduser("~"))
 ]
 
 # PLEASE USE NEW config-default.yaml FOR CONFIGURATION VARIABLES, NOT THIS FILE!
